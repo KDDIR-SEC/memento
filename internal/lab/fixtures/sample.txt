@@ -1,0 +1,2 @@
+This is a non-sensitive fixture managed by memento.
+It is intended only for the isolated ransomware-recovery laboratory.

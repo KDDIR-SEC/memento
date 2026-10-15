@@ -1,0 +1,6 @@
+scenario	label	duration_s	records	bytes	records_s	bytes_s	bytes_per_record	mb_per_day	drop_count
+boot	idle(boot)	64	76	5472	1.19	85.5	72.0	7.387	0
+idle	idle(600s)	600	40	2880	0.07	4.8	72.0	0.415	0
+rngd-boot	rngd(boot)	64	414	29808	6.47	465.8	72.0	40.241	0
+rngd	rngd(600s)	600	378	27216	0.63	45.4	72.0	3.919	0
+rngd-load	rngd(600s,+load)	600	378	27216	0.63	45.4	72.0	3.919	0

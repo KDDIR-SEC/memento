@@ -1,0 +1,625 @@
+Memento modification notice
+
+This patch changes Linux KVM to record guest RDRAND and RDSEED results.
+The Memento changes were made on 2026-09-30, 2026-10-06, and 2026-10-15.
+The SPDX identifiers inside the patched Linux files follow the Linux kernel's
+GPL-2.0-only licensing convention.
+
+diff --git a/arch/x86/kvm/Makefile b/arch/x86/kvm/Makefile
+index c4b8950c7abeeb252ca4d7344d65e1deea7ef707..b4797754eb24c2033cd8cad50766c1d46969a422 100644
+--- a/arch/x86/kvm/Makefile
++++ b/arch/x86/kvm/Makefile
+@@ -15,7 +15,8 @@ kvm-$(CONFIG_KVM_XEN)	+= xen.o
+ kvm-$(CONFIG_KVM_SMM)	+= smm.o
+ 
+ kvm-intel-y		+= vmx/vmx.o vmx/vmenter.o vmx/pmu_intel.o vmx/vmcs12.o \
+-			   vmx/nested.o vmx/posted_intr.o vmx/main.o
++			   vmx/nested.o vmx/posted_intr.o vmx/main.o \
++			   rndlog.o
+ 
+ kvm-intel-$(CONFIG_X86_SGX_KVM)	+= vmx/sgx.o
+ kvm-intel-$(CONFIG_KVM_HYPERV)	+= vmx/hyperv.o vmx/hyperv_evmcs.o
+diff --git a/arch/x86/kvm/rndlog.c b/arch/x86/kvm/rndlog.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..ab0348772374c59180df34f0359f80498a2b770a
+--- /dev/null
++++ b/arch/x86/kvm/rndlog.c
+@@ -0,0 +1,261 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * KVM RDRAND/RDSEED ログ記録モジュール - リングバッファ + debugfs（Phase 5/6）
++ *
++ * VM-exit handler（アトミックコンテキスト）から rndlog_record() で呼び出され、
++ * 固定長バイナリレコードをカーネル内リングバッファへ格納する。
++ * バッファ満杯時は drop モードでレコードを破棄し drop_count を増やす。
++ *
++ * Phase 6: /sys/kernel/debug/kvm_rndlog/ に以下を公開する。
++ *   enabled    (rw) 記録の有効/無効（既定 true。エミュレーション自体は常時実行）
++ *   buffer     (ro) リングバッファを struct rndlog_record 単位で FIFO 消費
++ *   stats      (ro) total(seq) / drop_count / used を文字列で返す
++ *   drop_count (ro) 破棄件数
++ *
++ * 本ファイルは kvm-intel.ko にリンクされる（arch/x86/kvm/Makefile）。
++ *
++ * 固定長レコードをdebugfsリングへ格納し、drop統計を公開する。
++ */
++
++#include <linux/types.h>
++#include <linux/build_bug.h>
++#include <linux/spinlock.h>
++#include <linux/atomic.h>
++#include <linux/string.h>
++#include <linux/debugfs.h>
++#include <linux/uaccess.h>
++#include <linux/fs.h>
++#include <linux/module.h>
++#include <asm/tsc.h>		/* tsc_khz（ハンドラ計時のサイクル→ns 換算） */
++
++#include "rndlog.h"
++
++/*
++ * リングバッファのレコード数（2 の冪）。
++ * sizeof(struct rndlog_record) ≒ 104B のため 65536 件で約 6.8 MiB。
++ */
++#define RNDLOG_NR_RECORDS	65536U
++#define RNDLOG_MASK		(RNDLOG_NR_RECORDS - 1U)
++
++static struct rndlog_record rndlog_buf[RNDLOG_NR_RECORDS];
++static DEFINE_SPINLOCK(rndlog_lock);
++static unsigned int rndlog_head;	/* 次に書き込む位置 */
++static unsigned int rndlog_tail;	/* 次に読み出す位置（debugfs buffer 消費） */
++static unsigned int rndlog_count;	/* 未読レコード数 */
++static u64 rndlog_drop_count;		/* バッファ満杯で破棄した件数 */
++static atomic64_t rndlog_seq = ATOMIC64_INIT(0);
++static bool rndlog_enabled = true;	/* 記録の有効/無効（debugfs enabled） */
++
++/*
++ * 性能分解用カウンタ: VM-exit handler のソフトウェア処理時間(ii) を累積する。
++ * lock を持たず atomic 加算のみ（記録のホットパスに余計な競合を足さない）。
++ */
++static atomic64_t rndlog_handler_cycles = ATOMIC64_INIT(0);
++static atomic64_t rndlog_handler_calls  = ATOMIC64_INIT(0);
++
++/*
++ * 診断用: buffer(debugfs) 経由で rndlogd へ配信したレコード総数。
++ * total_records(enqueue) == consumed == host JSONL 行数 かつ drop_count==0 なら
++ * 「drop_count=0 ⟹ 100% 捕捉」が成立。consumed<total_records ならカーネル側の
++ * 取りこぼし（容量超過時の挙動）を、host<consumed なら rndlogd 側の取りこぼしを示す。
++ */
++static atomic64_t rndlog_consumed = ATOMIC64_INIT(0);
++
++static struct dentry *rndlog_dir;
++
++#ifdef MEMENTO_KVM_VALIDATION_FAULTS
++static unsigned int rndlog_fail_init_after;
++module_param_named(rndlog_fail_init_after, rndlog_fail_init_after, uint, 0400);
++MODULE_PARM_DESC(rndlog_fail_init_after,
++		 "validation only: fail after debugfs initialization step N");
++#endif
++
++static bool rndlog_fault_requested(unsigned int step)
++{
++#ifdef MEMENTO_KVM_VALIDATION_FAULTS
++	return rndlog_fail_init_after == step;
++#else
++	(void)step;
++	return false;
++#endif
++}
++
++void rndlog_record(struct rndlog_record *rec)
++{
++	unsigned long flags;
++
++	if (!READ_ONCE(rndlog_enabled))
++		return;
++
++	/* 共通フィールドはここで確定させる（呼び出し元の取りこぼし防止） */
++	rec->magic = RNDLOG_MAGIC;
++	rec->version = RNDLOG_VERSION;
++	rec->record_size = sizeof(*rec);
++	rec->seq = (u64)atomic64_inc_return(&rndlog_seq);
++
++	spin_lock_irqsave(&rndlog_lock, flags);
++	if (rndlog_count >= RNDLOG_NR_RECORDS) {
++		/* drop モード: 満杯ならレコードを破棄してゲスト実行を継続させる */
++		rndlog_drop_count++;
++	} else {
++		rndlog_buf[rndlog_head] = *rec;
++		rndlog_head = (rndlog_head + 1) & RNDLOG_MASK;
++		rndlog_count++;
++	}
++	spin_unlock_irqrestore(&rndlog_lock, flags);
++}
++
++void rndlog_account_handler(u64 cycles)
++{
++	atomic64_add((s64)cycles, &rndlog_handler_cycles);
++	atomic64_inc(&rndlog_handler_calls);
++}
++
++/* リングバッファから 1 レコードを取り出す。取り出せたら true。 */
++static bool rndlog_dequeue(struct rndlog_record *out)
++{
++	unsigned long flags;
++	bool got = false;
++
++	spin_lock_irqsave(&rndlog_lock, flags);
++	if (rndlog_count > 0) {
++		*out = rndlog_buf[rndlog_tail];
++		rndlog_tail = (rndlog_tail + 1) & RNDLOG_MASK;
++		rndlog_count--;
++		got = true;
++	}
++	spin_unlock_irqrestore(&rndlog_lock, flags);
++	return got;
++}
++
++/*
++ * buffer: レコード単位で FIFO 読み出し。
++ * copy_to_user は spinlock 外で呼ぶ（dequeue でスタックへ複製してから転送）。
++ * 空のときは 0 を返す（ユーザー空間はポーリングで待つ）。
++ */
++static ssize_t rndlog_buffer_read(struct file *file, char __user *ubuf,
++				  size_t count, loff_t *ppos)
++{
++	struct rndlog_record rec;
++	size_t done = 0;
++
++	while (count - done >= sizeof(rec)) {
++		if (!rndlog_dequeue(&rec))
++			break;
++		if (copy_to_user(ubuf + done, &rec, sizeof(rec)))
++			return done ? (ssize_t)done : -EFAULT;
++		done += sizeof(rec);
++		atomic64_inc(&rndlog_consumed);
++	}
++	return done;
++}
++
++static const struct file_operations rndlog_buffer_fops = {
++	.owner = THIS_MODULE,
++	.read  = rndlog_buffer_read,
++	.llseek = noop_llseek,
++};
++
++/* stats: 統計値をテキストで返す */
++static ssize_t rndlog_stats_read(struct file *file, char __user *ubuf,
++				 size_t count, loff_t *ppos)
++{
++	char buf[384];
++	unsigned int used;
++	unsigned long flags;
++	u64 hcalls, hcycles, avg_cyc, avg_ns;
++	int len;
++
++	spin_lock_irqsave(&rndlog_lock, flags);
++	used = rndlog_count;
++	spin_unlock_irqrestore(&rndlog_lock, flags);
++
++	/* 性能分解: ハンドラ内処理(ii) の平均サイクル/ns（手計算用に生値も出す） */
++	hcalls  = (u64)atomic64_read(&rndlog_handler_calls);
++	hcycles = (u64)atomic64_read(&rndlog_handler_cycles);
++	avg_cyc = hcalls ? hcycles / hcalls : 0;
++	avg_ns  = (tsc_khz && hcalls) ? avg_cyc * 1000000ULL / tsc_khz : 0;
++
++	len = scnprintf(buf, sizeof(buf),
++			"total_records: %llu\nconsumed: %llu\ndrop_count: %llu\nbuffer_used: %u\nbuffer_capacity: %u\nenabled: %d\n"
++			"handler_calls: %llu\nhandler_cycles_total: %llu\nhandler_cycles_avg: %llu\ntsc_khz: %u\nhandler_ns_avg: %llu\n",
++			(u64)atomic64_read(&rndlog_seq),
++			(u64)atomic64_read(&rndlog_consumed),
++			(u64)READ_ONCE(rndlog_drop_count),
++			used, RNDLOG_NR_RECORDS, rndlog_enabled ? 1 : 0,
++			hcalls, hcycles, avg_cyc, tsc_khz, avg_ns);
++
++	return simple_read_from_buffer(ubuf, count, ppos, buf, len);
++}
++
++static const struct file_operations rndlog_stats_fops = {
++	.owner = THIS_MODULE,
++	.read  = rndlog_stats_read,
++	.llseek = default_llseek,
++};
++
++int rndlog_init(void)
++{
++	struct dentry *entry;
++	int err;
++
++	BUILD_BUG_ON(sizeof(struct rndlog_record) != 104);
++	BUILD_BUG_ON(offsetof(struct rndlog_record, inst) != 64);
++	BUILD_BUG_ON(offsetof(struct rndlog_record, operand_bits) != 65);
++	BUILD_BUG_ON(offsetof(struct rndlog_record, insn_len) != 68);
++	BUILD_BUG_ON(offsetof(struct rndlog_record, insn_bytes) != 72);
++	BUILD_BUG_ON(offsetof(struct rndlog_record, value) != 88);
++	BUILD_BUG_ON(offsetof(struct rndlog_record, cpu) != 96);
++	BUILD_BUG_ON(offsetof(struct rndlog_record, reserved) != 100);
++	rndlog_dir = debugfs_create_dir("kvm_rndlog", NULL);
++	if (IS_ERR(rndlog_dir)) {
++		err = PTR_ERR(rndlog_dir);
++		rndlog_dir = NULL;
++		return err;
++	}
++	if (rndlog_fault_requested(1)) {
++		entry = ERR_PTR(-EIO);
++		goto fail;
++	}
++
++	debugfs_create_bool("enabled", 0644, rndlog_dir, &rndlog_enabled);
++	if (rndlog_fault_requested(2)) {
++		entry = ERR_PTR(-EIO);
++		goto fail;
++	}
++	entry = debugfs_create_file("buffer", 0400, rndlog_dir, NULL,
++				    &rndlog_buffer_fops);
++	if (IS_ERR(entry))
++		goto fail;
++	if (rndlog_fault_requested(3)) {
++		entry = ERR_PTR(-EIO);
++		goto fail;
++	}
++	entry = debugfs_create_file("stats", 0400, rndlog_dir, NULL,
++				    &rndlog_stats_fops);
++	if (IS_ERR(entry))
++		goto fail;
++	if (rndlog_fault_requested(4)) {
++		entry = ERR_PTR(-EIO);
++		goto fail;
++	}
++	debugfs_create_u64("drop_count", 0400, rndlog_dir,
++			   &rndlog_drop_count);
++	if (rndlog_fault_requested(5)) {
++		entry = ERR_PTR(-EIO);
++		goto fail;
++	}
++	return 0;
++
++fail:
++	err = PTR_ERR(entry);
++	debugfs_remove_recursive(rndlog_dir);
++	rndlog_dir = NULL;
++	return err;
++}
++
++void rndlog_exit(void)
++{
++	debugfs_remove_recursive(rndlog_dir);
++	rndlog_dir = NULL;
++}
+diff --git a/arch/x86/kvm/rndlog.h b/arch/x86/kvm/rndlog.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..f707b20168614e3415b3e14d5bed25551cedf5f9
+--- /dev/null
++++ b/arch/x86/kvm/rndlog.h
+@@ -0,0 +1,108 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * KVM RDRAND/RDSEED ログ記録モジュール
++ *
++ * ゲストの RDRAND/RDSEED 実行時に VM-exit で捕捉した値を
++ * リングバッファへ記録するための内部 API 定義。
++ *
++ * KVM側producerとuserspace consumerが共有するレコード形式を定義する。
++ */
++
++#ifndef __KVM_RNDLOG_H
++#define __KVM_RNDLOG_H
++
++#include <linux/types.h>
++
++/* ログレコードの識別マジック値: "RNDL" */
++#define RNDLOG_MAGIC    0x524E444CU
++
++/* ログレコードのバージョン */
++#define RNDLOG_VERSION  1
++
++/**
++ * enum rndlog_inst - 捕捉した命令の種別
++ */
++enum rndlog_inst {
++	RNDLOG_INST_RDRAND = 1,
++	RNDLOG_INST_RDSEED = 2,
++};
++
++/**
++ * struct rndlog_record - カーネル内リングバッファに格納する固定長バイナリレコード
++ *
++ * VM-exit handler 内（アトミックコンテキスト）で書き込まれるため、
++ * フィールドはすべて基本型で構成する。
++ *
++ * ユーザー空間 rndlogd はこの構造体を debugfs 経由で読み出し、
++ * value と operand_bits から JSONL 形式へ変換して保存する。
++ */
++struct rndlog_record {
++	__u32 magic;			/* RNDLOG_MAGIC (0x524E444C) */
++	__u16 version;			/* RNDLOG_VERSION (1) */
++	__u16 record_size;		/* sizeof(struct rndlog_record) */
++
++	__u64 seq;			/* 単調増加するシーケンス番号 */
++	__u64 ktime_ns;			/* ktime_get_ns() で取得した記録時刻（ns） */
++
++	__u32 vm_id;			/* VM 識別子（vcpu->kvm のポインタ値） */
++	__u32 vcpu_id;			/* vCPU ID（vcpu->vcpu_id） */
++
++	__u64 guest_rip;		/* VM-exit 時点のゲスト RIP */
++	__u64 guest_cr3;		/* VM-exit 時点のゲスト CR3（プロセス特定用） */
++	__u64 guest_rflags_before;	/* 命令実行前の RFLAGS */
++	__u64 guest_rflags_after;	/* 命令実行後の RFLAGS（CF=1 に設定済み） */
++
++	__u8  inst;			/* enum rndlog_inst: RDRAND=1, RDSEED=2 */
++	__u8  operand_bits;		/* オペランド幅: 16, 32, または 64 */
++	__u8  dest_reg;			/* 宛先レジスタインデックス（0=RAX … 15=R15） */
++	__u8  success;			/* 1=成功（CF=1）、0=失敗（CF=0） */
++
++	__u32 insn_len;			/* 命令長（VM_EXIT_INSTRUCTION_LEN から取得） */
++	__u8  insn_bytes[16];		/* 命令バイト列（デバッグ・検証用） */
++
++	__u64 value;			/* ゲストに返却した乱数値（operand_bits でマスク済み） */
++
++	__u32 cpu;			/* smp_processor_id()（ホスト物理 CPU 番号） */
++	__u32 reserved;			/* パディング（将来拡張用、0 で初期化） */
++};
++
++/**
++ * rndlog_record() - リングバッファへログレコードを追加する
++ * @rec: 書き込むレコード（呼び出し元が全フィールドを設定済みであること）
++ *
++ * VM-exit handler（アトミックコンテキスト）から呼び出される。
++ * バッファ満杯時は drop モードでレコードを破棄し drop_count を増やす。
++ *
++ * 実装: arch/x86/kvm/rndlog.c（Phase 5 で追加）
++ */
++void rndlog_record(struct rndlog_record *rec);
++
++/**
++ * rndlog_account_handler() - VM-exit handler の処理サイクル数を集計する
++ * @cycles: ハンドラ入口〜返却直前の TSC サイクル差（rdtsc() の差分）
++ *
++ * 性能分解（手法本質コスト vs nested 由来コスト）の測定用。
++ * ハンドラ内ソフトウェア処理時間(ii) を累積し、debugfs stats で平均を公開する。
++ * VM-exit handler（アトミックコンテキスト）から呼び出される。
++ *
++ * 実装: arch/x86/kvm/rndlog.c
++ */
++void rndlog_account_handler(__u64 cycles);
++
++/**
++ * rndlog_init() - リングバッファと debugfs エントリを初期化する
++ *
++ * kvm_intel モジュール初期化時に呼び出す。
++ * 実装: arch/x86/kvm/rndlog.c（Phase 5 で追加）
++ */
++int rndlog_init(void);
++
++/**
++ * rndlog_exit() - リングバッファと debugfs エントリを解放する
++ *
++ * kvm_intel モジュール終了時に呼び出す。
++ * 実装: arch/x86/kvm/rndlog.c（Phase 5 で追加）
++ */
++void rndlog_exit(void);
++
++#endif /* __KVM_RNDLOG_H */
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 7bd1679634e936ec1b1d4caa10f9f7b636f64216..6f3dd1cc54b999dac58fccaf5223c76a97dcedab 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -23,6 +23,7 @@
+ #include <linux/mod_devicetable.h>
+ #include <linux/mm.h>
+ #include <linux/objtool.h>
++#include <linux/random.h>
+ #include <linux/sched.h>
+ #include <linux/sched/smt.h>
+ #include <linux/slab.h>
+@@ -71,6 +72,7 @@
+ #include "vmx.h"
+ #include "x86.h"
+ #include "x86_ops.h"
++#include "rndlog.h"
+ #include "smm.h"
+ #include "vmx_onhyperv.h"
+ #include "posted_intr.h"
+@@ -4566,6 +4568,12 @@ static u32 vmx_secondary_exec_control(struct vcpu_vmx *vmx)
+ 	vmx_adjust_sec_exec_exiting(vmx, &exec_control, rdrand, RDRAND);
+ 	vmx_adjust_sec_exec_exiting(vmx, &exec_control, rdseed, RDSEED);
+ 
++	/* kvm_rndlog: always intercept RDRAND/RDSEED for monitoring */
++	if (cpu_has_vmx_rdrand())
++		exec_control |= SECONDARY_EXEC_RDRAND_EXITING;
++	if (cpu_has_vmx_rdseed())
++		exec_control |= SECONDARY_EXEC_RDSEED_EXITING;
++
+ 	vmx_adjust_sec_exec_control(vmx, &exec_control, waitpkg, WAITPKG,
+ 				    ENABLE_USR_WAIT_PAUSE, false);
+ 
+@@ -6026,6 +6034,158 @@ static int handle_wrmsr_imm(struct kvm_vcpu *vcpu)
+ 				     vmx_get_msr_imm_reg(vcpu));
+ }
+ 
++/*
++ * kvm_rndlog: Phase 5 - RDRAND/RDSEED 実乱数生成 + リングバッファ記録
++ *
++ * RDRAND/RDSEED 命令（0F C7 /6, /7）をデコードして宛先レジスタとオペランド幅を
++ * 求め、get_random_bytes() で生成した値を書き戻して CF=1 を設定する。
++ * 生成値・命令メタデータを struct rndlog_record にまとめ rndlog_record() で
++ * カーネル内リングバッファへ記録する（debugfs 公開は Phase 6）。
++ *
++ * emulate.c は RDRAND/RDSEED を実装しないため汎用エミュレータには委譲しない。
++ * デコード失敗時は CF=0 を返して命令をスキップし、ゲストを保護する。
++ *
++ * モジュールパラメータ rndlog_deterministic=1 のときは固定値を返す
++ * （再現性テスト・Phase 4 回帰用）。
++ */
++#define RNDLOG_FIXED_RDRAND	0x1122334455667788ULL
++#define RNDLOG_FIXED_RDSEED	0x8877665544332211ULL
++
++static bool rndlog_deterministic;
++module_param_named(rndlog_deterministic, rndlog_deterministic, bool, 0644);
++MODULE_PARM_DESC(rndlog_deterministic,
++		 "kvm_rndlog: get_random_bytes() の代わりに固定値を返す（再現性テスト用）");
++
++static int handle_rndlog(struct kvm_vcpu *vcpu, bool is_rdseed)
++{
++	const char *name = is_rdseed ? "RDSEED" : "RDRAND";
++	u64 t0 = rdtsc();	/* kvm_rndlog: ハンドラ処理時間(ii) の計測 */
++	u64 fixed = is_rdseed ? RNDLOG_FIXED_RDSEED : RNDLOG_FIXED_RDRAND;
++	u32 insn_len = vmcs_read32(VM_EXIT_INSTRUCTION_LEN);
++	unsigned long rip = kvm_rip_read(vcpu);
++	unsigned long rflags_before = vmx_get_rflags(vcpu);
++	struct x86_exception e;
++	struct rndlog_record rec;
++	unsigned long rflags;
++	u64 rnd;
++	u8 insn[16];
++	u8 modrm;
++	int i = 0, reg, bits;
++	bool rex_w = false, rex_b = false, opsize = false;
++
++	if (insn_len == 0 || insn_len > sizeof(insn))
++		goto fail;
++	if (kvm_read_guest_virt(vcpu, kvm_get_linear_rip(vcpu),
++				insn, insn_len, &e))
++		goto fail;
++
++	/* レガシープレフィックスと REX をスキャン */
++	while (i < insn_len) {
++		u8 b = insn[i];
++
++		if (b == 0x66) {		/* operand-size override */
++			opsize = true;
++			i++;
++			continue;
++		}
++		if (b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3 ||
++		    b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 ||
++		    b == 0x64 || b == 0x65) {	/* その他のプレフィックス */
++			i++;
++			continue;
++		}
++		if ((b & 0xF0) == 0x40) {	/* REX prefix */
++			rex_w = b & 0x08;
++			rex_b = b & 0x01;
++			i++;
++			continue;
++		}
++		break;
++	}
++
++	/* opcode は 0F C7、続く ModRM で宛先を決定 */
++	if (i + 2 >= insn_len || insn[i] != 0x0F || insn[i + 1] != 0xC7)
++		goto fail;
++
++	modrm = insn[i + 2];
++	reg = (modrm & 0x07) | (rex_b ? 0x08 : 0x00);
++	bits = rex_w ? 64 : (opsize ? 16 : 32);
++	if ((modrm & 0xC0) != 0xC0 || ((modrm >> 3) & 0x07) != (is_rdseed ? 7 : 6))
++		goto fail;
++
++	/* 値生成: 既定は実乱数、rndlog_deterministic 時は固定値。幅にマスク */
++	if (rndlog_deterministic)
++		rnd = fixed;
++	else
++		get_random_bytes(&rnd, sizeof(rnd));
++	if (bits == 16)
++		rnd &= 0xFFFFULL;
++	else if (bits == 32)
++		rnd &= 0xFFFFFFFFULL;
++
++	/* オペランド幅に応じた書き戻し */
++	if (bits == 16) {
++		/* 下位 16bit のみ更新し、上位は保持 */
++		u64 cur = kvm_register_read_raw(vcpu, reg);
++
++		kvm_register_write_raw(vcpu, reg, (cur & ~0xFFFFULL) | rnd);
++	} else {
++		/* 32bit はゼロ拡張（rnd は既にマスク済み）、64bit は全体 */
++		kvm_register_write_raw(vcpu, reg, rnd);
++	}
++
++	/* 成功: CF=1、OF/SF/ZF/AF/PF=0 */
++	rflags = rflags_before;
++	rflags |= X86_EFLAGS_CF;
++	rflags &= ~(X86_EFLAGS_OF | X86_EFLAGS_SF | X86_EFLAGS_ZF |
++		    X86_EFLAGS_AF | X86_EFLAGS_PF);
++	vmx_set_rflags(vcpu, rflags);
++
++	/* リングバッファへ記録（magic/version/record_size/seq は rndlog_record が設定） */
++	memset(&rec, 0, sizeof(rec));
++	rec.ktime_ns = ktime_get_ns();
++	rec.vm_id = (u32)(uintptr_t)vcpu->kvm;
++	rec.vcpu_id = vcpu->vcpu_id;
++	rec.guest_rip = rip;
++	rec.guest_cr3 = kvm_read_cr3(vcpu);
++	rec.guest_rflags_before = rflags_before;
++	rec.guest_rflags_after = rflags;
++	rec.inst = is_rdseed ? RNDLOG_INST_RDSEED : RNDLOG_INST_RDRAND;
++	rec.operand_bits = bits;
++	rec.dest_reg = reg;
++	rec.success = 1;
++	rec.insn_len = insn_len;
++	memcpy(rec.insn_bytes, insn, min_t(u32, insn_len, sizeof(rec.insn_bytes)));
++	rec.value = rnd;
++	rec.cpu = raw_smp_processor_id();
++	rndlog_record(&rec);
++
++	pr_info_ratelimited("kvm_rndlog: %s vcpu=%d rip=0x%lx reg=%d bits=%d val=0x%llx seq=%llu\n",
++			    name, vcpu->vcpu_id, rip, reg, bits, rec.value, rec.seq);
++	rndlog_account_handler(rdtsc() - t0);
++	return kvm_skip_emulated_instruction(vcpu);
++
++fail:
++	/* デコード失敗時は CF=0（乱数なし）でスキップしてゲストを保護 */
++	pr_info_ratelimited("kvm_rndlog: %s vcpu=%d rip=0x%lx decode-fail (CF=0)\n",
++			    name, vcpu->vcpu_id, rip);
++	rflags = vmx_get_rflags(vcpu) & ~(X86_EFLAGS_CF | X86_EFLAGS_OF |
++		 X86_EFLAGS_SF | X86_EFLAGS_ZF | X86_EFLAGS_AF | X86_EFLAGS_PF);
++	vmx_set_rflags(vcpu, rflags);
++	rndlog_account_handler(rdtsc() - t0);
++	return kvm_skip_emulated_instruction(vcpu);
++}
++
++static int handle_rdrand(struct kvm_vcpu *vcpu)
++{
++	return handle_rndlog(vcpu, false);
++}
++
++static int handle_rdseed(struct kvm_vcpu *vcpu)
++{
++	return handle_rndlog(vcpu, true);
++}
++
+ /*
+  * The exit handlers return 1 if the exit was handled fully and guest execution
+  * may resume.  Otherwise they set the kvm_run parameter to indicate what needs
+@@ -6075,8 +6235,8 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+ 	[EXIT_REASON_MONITOR_INSTRUCTION]     = kvm_emulate_monitor,
+ 	[EXIT_REASON_INVEPT]                  = handle_vmx_instruction,
+ 	[EXIT_REASON_INVVPID]                 = handle_vmx_instruction,
+-	[EXIT_REASON_RDRAND]                  = kvm_handle_invalid_op,
+-	[EXIT_REASON_RDSEED]                  = kvm_handle_invalid_op,
++	[EXIT_REASON_RDRAND]                  = handle_rdrand,
++	[EXIT_REASON_RDSEED]                  = handle_rdseed,
+ 	[EXIT_REASON_PML_FULL]		      = handle_pml_full,
+ 	[EXIT_REASON_INVPCID]                 = handle_invpcid,
+ 	[EXIT_REASON_VMFUNC]		      = handle_vmx_instruction,
+@@ -8570,6 +8730,8 @@ static void vmx_cleanup_l1d_flush(void)
+ 
+ void vmx_exit(void)
+ {
++	rndlog_exit();		/* kvm_rndlog: リングバッファ/ debugfs の解放 */
++
+ 	allow_smaller_maxphyaddr = false;
+ 
+ 	vmx_cleanup_l1d_flush();
+@@ -8623,6 +8785,10 @@ int __init vmx_init(void)
+ 	if (!enable_ept)
+ 		allow_smaller_maxphyaddr = true;
+ 
++	r = rndlog_init();	/* kvm_rndlog: ring/debugfs initialization */
++	if (r)
++		goto err_l1d_flush;
++
+ 	return 0;
+ 
+ err_l1d_flush:

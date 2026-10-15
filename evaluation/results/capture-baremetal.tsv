@@ -1,0 +1,2 @@
+pattern	inst	count	threads	time_s	ns_per_op	host_lines	drop_count	matched	missing	match_rate	handler_ns
+A	RDRAND r64	1000000	1	19.989390	19989.390	1000092	0	1000000	0	100.0000	359.9
