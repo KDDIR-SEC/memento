@@ -11,6 +11,11 @@ LABEL org.opencontainers.image.title="memento laboratory runtime" \
       org.opencontainers.image.licenses="GPL-2.0-only" \
       io.memento.binary.sha256="${MEMENTO_BINARY_SHA256}"
 
+# The wrapper mounts host directories at their host paths. Remove the base
+# image's ubuntu user so that its private /home/ubuntu does not hide a host
+# home of the same name from the capability-less container root.
+RUN userdel --remove ubuntu
+
 COPY --chmod=0755 build/memento /usr/local/bin/memento
 
 RUN test -n "${MEMENTO_REVISION}" \

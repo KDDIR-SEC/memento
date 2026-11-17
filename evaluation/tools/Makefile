@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 CC      = gcc
-# guest_record.h（struct guest_record 共有）を include
+# Include guest_record.h (shared struct guest_record)
 GR_INC := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../guest/src)
 CFLAGS  = -O2 -Wall -Wextra -I$(GR_INC)
 

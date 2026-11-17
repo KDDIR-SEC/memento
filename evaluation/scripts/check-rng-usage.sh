@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
-# check-rng-usage.sh - 監視対象プロセスが RDRAND/RDSEED を駆動するかの事前検証
+# check-rng-usage.sh - pre-check whether monitored processes drive RDRAND/RDSEED
 #
-# ストレージ評価の前提として、nginx/ssh 等が「RDRAND/RDSEED 経由」で乱数を取得しているかを
-# 二方式で確認する:
-#   (1) 静的: バイナリ/共有ライブラリに rdrand/rdseed 命令が含まれるか（objdump、ゲスト内）。
-#       ※ 含まれていても実行されるとは限らない（あくまで可能性）。
-#   (2) 動的: カーネル debugfs stats の total_records 差分を短窓で比較し、idle 比で各負荷が
-#       実際に捕捉数を増やすか（＝ゲストで RDRAND/RDSEED を実行しているか）を確定する。
+# As a prerequisite for the storage evaluation, check in two ways whether
+# nginx, ssh and similar obtain random numbers "via RDRAND/RDSEED":
+#   (1) Static: whether the binaries/shared libraries contain rdrand/rdseed
+#       instructions (objdump, inside the guest).
+#       Note: containing them does not mean they are executed (only possible).
+#   (2) Dynamic: compare the total_records delta of the kernel debugfs stats
+#       over a short window, and establish whether each load actually raises
+#       the capture count relative to idle (that is, whether the guest
+#       executes RDRAND/RDSEED).
 #
-# 前提: 改造 kvm-intel ロード済み・ゲスト起動済み・provision-guest-server.sh 実行済み。
-# 使い方（root 必須: debugfs 読み出し）:
+# Prerequisites: modified kvm-intel loaded, guest running,
+# provision-guest-server.sh already run.
+# Usage (root required: reads debugfs):
 #   SSHPASS=ubuntu sudo -E ./scripts/eval/check-rng-usage.sh [--window 30]
 set -euo pipefail
 
@@ -32,26 +36,26 @@ done
 ssh_cmd() { if [[ -n "${SSHPASS:-}" ]] && command -v sshpass >/dev/null; then sshpass -e ssh -o StrictHostKeyChecking=no -p "$SSH_PORT" "$@"; else ssh -o StrictHostKeyChecking=no -p "$SSH_PORT" "$@"; fi; }
 stat_get() { sed -n "s/^$1:[[:space:]]*\([0-9]*\).*/\1/p" "$DEBUGFS/stats" 2>/dev/null; }
 
-[[ -e "$DEBUGFS/stats" ]] || { echo "ERROR: $DEBUGFS が無い（改造モジュール未ロード？）"; exit 1; }
+[[ -e "$DEBUGFS/stats" ]] || { echo "ERROR: $DEBUGFS is missing (modified module not loaded?)"; exit 1; }
 echo 1 > "$DEBUGFS/enabled"
 
 echo "=========================================================="
-echo " (1) 静的解析: rdrand/rdseed 命令の有無（ゲスト内 objdump）"
+echo " (1) Static analysis: rdrand/rdseed instructions present? (objdump in the guest)"
 echo "=========================================================="
 ssh_cmd "$GUEST" 'bash -s' <<'REMOTE'
 set -e
-command -v objdump >/dev/null || { echo "objdump 不在（binutils 未導入）。provision-guest-server.sh を先に実行してください。"; exit 0; }
+command -v objdump >/dev/null || { echo "objdump not found (binutils not installed). Run provision-guest-server.sh first."; exit 0; }
 libs=$(ldconfig -p | sed -n 's/.* => //p' | grep -E '/libcrypto\.so|/libssl\.so|/libc\.so' | sort -u)
 for f in /usr/sbin/sshd /usr/sbin/nginx $libs; do
 	[ -r "$f" ] || continue
 	n=$(objdump -d "$f" 2>/dev/null | grep -icE '\<rdrand\>|\<rdseed\>' || true)
-	printf '  %-48s rdrand/rdseed 命令数: %s\n' "$f" "$n"
+	printf '  %-48s rdrand/rdseed instructions: %s\n' "$f" "$n"
 done
 REMOTE
 
 echo
 echo "=========================================================="
-echo " (2) 動的解析: idle 比の total_records 増分（各 ${WIN}s）"
+echo " (2) Dynamic analysis: total_records increase relative to idle (${WIN}s each)"
 echo "=========================================================="
 
 start_load() { # $1 = guest shell command (loop body)
@@ -62,7 +66,7 @@ stop_load() {
 	sleep 1
 }
 
-probe() { # $1 = label   $2 = loop body (空文字なら idle)
+probe() { # $1 = label   $2 = loop body (empty string means idle)
 	local before after delta rate
 	[[ -n "$2" ]] && start_load "$2"
 	before=$(stat_get total_records)
@@ -74,7 +78,7 @@ probe() { # $1 = label   $2 = loop body (空文字なら idle)
 	printf '  %-12s : Δtotal_records=%-10s (~%s rec/s)\n' "$1" "$delta" "$rate"
 }
 
-probe_rngd() { # rngd（rng-tools5）はデーモンのため loop ではなく start/stop で計る。起動バーストを含む。
+probe_rngd() { # rngd (rng-tools5) is a daemon, so measure with start/stop rather than a loop. Includes the startup burst.
 	local before after delta rate
 	ssh_cmd "$GUEST" 'sudo pkill -x rngd 2>/dev/null; true' >/dev/null 2>&1 || true
 	sleep 1
@@ -85,19 +89,21 @@ probe_rngd() { # rngd（rng-tools5）はデーモンのため loop ではなく 
 	after=$(stat_get total_records)
 	delta=$(( ${after:-0} - ${before:-0} ))
 	rate=$(awk -v d="$delta" -v w="$WIN" 'BEGIN{printf "%.1f", (w>0 ? d/w : 0)}')
-	printf '  %-12s : Δtotal_records=%-10s (~%s rec/s, 起動バースト含む)\n' "rngd" "$delta" "$rate"
+	printf '  %-12s : Δtotal_records=%-10s (~%s rec/s, incl. startup burst)\n' "rngd" "$delta" "$rate"
 }
 
 probe "idle"      ""
 probe "nginx-tls" 'while :; do curl -sk https://localhost/ -o /dev/null; done'
 probe "ssh-kex"   'while :; do sshpass -p ubuntu ssh -o StrictHostKeyChecking=no localhost true; done'
-probe_rngd        # RDRAND を駆動する想定のデーモン（rng-tools5）
+probe_rngd        # Daemon expected to drive RDRAND (rng-tools5)
 
 echo
-echo "rngd が Δ≈0 の場合: 既定で jitter 等が選ばれている可能性。'rngd -f -x jitter' 等で rdrand を"
-echo "明示し再確認する（rng-tools5 のソース名は版差あり）。起動バーストのみで定常 0 なら近代カーネルの"
-echo "プール満杯による（§ ドキュメント参照）。"
+echo "If rngd shows Δ≈0: jitter or another source may be selected by default. Name rdrand"
+echo "explicitly (e.g. 'rngd -f -x jitter') and check again (rng-tools5 source names differ by"
+echo "version). If there is only a startup burst and 0 in steady state, the pool of a modern"
+echo "kernel is full (see the documentation)."
 echo
-echo "判定の目安: idle 比で増分が有意なら、その負荷はゲストで RDRAND/RDSEED を実行している"
-echo "（＝ストレージに寄与）。idle と同等なら getrandom 等のカーネル経路で取得しており、"
-echo "ハイパーバイザー層では追加捕捉されない（ストレージはカーネル CRNG 由来が支配的）。"
+echo "Rule of thumb: if the increase over idle is significant, that load executes RDRAND/RDSEED"
+echo "in the guest (it contributes to storage). If it equals idle, it obtains randomness through a"
+echo "kernel path such as getrandom and nothing extra is captured at the hypervisor layer (storage"
+echo "is dominated by data derived from the kernel CRNG)."

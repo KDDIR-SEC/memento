@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * rdrand_bench.c - Phase 7 評価用 RDRAND/RDSEED ベンチマーク（ゲスト内実行）
+ * rdrand_bench.c - Phase 7 RDRAND/RDSEED benchmark for evaluation (runs in the guest)
  *
- * RDRAND/RDSEED を大量回数実行し、観測した値を struct guest_record の
- * バイナリ列としてファイルへ書き出す。ホスト側 rndlog-verify がこのログと
- * ホスト JSONL を照合して捕捉率を算出する。経過時間・ns/op は stderr に出す。
+ * Executes RDRAND/RDSEED many times and writes the observed values to a file
+ * as a binary sequence of struct guest_record. The host-side rndlog-verify
+ * matches this log against the host JSONL to compute the capture rate. The
+ * elapsed time and ns/op go to stderr.
  *
- * 評価パターン:
- *   A: --inst rdrand --bits 64       単純ループ
- *   B: --inst rdseed --bits 64       単純ループ
- *   C: --inst both   --bits all      16/32/64 混在
- *   D: --threads T                   マルチスレッド
+ * Evaluation patterns:
+ *   A: --inst rdrand --bits 64       simple loop
+ *   B: --inst rdseed --bits 64       simple loop
+ *   C: --inst both   --bits all      mixed 16/32/64
+ *   D: --threads T                   multi-threaded
  *
- * ビルド: make bench   （gcc -O2 -mrdrnd -mrdseed -pthread）
- * 例: ./rdrand_bench --inst rdrand --bits 64 --count 1000000 --output guest_values.bin
+ * Build: make bench   (gcc -O2 -mrdrnd -mrdseed -pthread)
+ * Example: ./rdrand_bench --inst rdrand --bits 64 --count 1000000 --output guest_values.bin
  */
 
 #define _GNU_SOURCE
@@ -39,19 +40,20 @@ enum bits_sel { BITS_16, BITS_32, BITS_64, BITS_ALL };
 struct opts {
 	enum inst_sel inst;
 	enum bits_sel bits;
-	uint64_t count;		/* 全スレッド合計の実行回数 */
+	uint64_t count;		/* Executions summed over all threads */
 	int threads;
-	uint64_t rate;		/* 発行レート上限 ops/sec（全スレッド合計、0=無制限） */
-	int pin_base;		/* -1=固定なし、それ以外は base+thread_id へ固定 */
+	uint64_t rate;		/* Issue rate cap in ops/sec (all threads, 0 = unlimited) */
+	int pin_base;		/* -1 = no pinning, otherwise pin to base+thread_id */
 };
 
-/* ペーシング判定の間隔（命令数, 2 の冪）。毎命令の nanosleep は粒度が粗く高コストなので
- * この間隔ごとに目標経過時刻と比較して先行分だけ待つ。 */
+/* Pacing check interval (instructions, a power of 2). A nanosleep per
+ * instruction is coarse and costly, so at this interval compare with the
+ * target elapsed time and wait only for the amount ahead of it. */
 #define PACE_CHUNK 1024u
 
 static double ts_diff(const struct timespec *a, const struct timespec *b);
 
-/* グローバル seq（スレッド間で単調増加） */
+/* Global seq (monotonically increasing across threads) */
 static uint64_t g_seq;
 static pthread_mutex_t g_seq_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -59,12 +61,12 @@ struct worker {
 	pthread_t tid;
 	int thread_id;
 	const struct opts *o;
-	uint64_t n;			/* このスレッドの実行回数 */
-	struct guest_record *recs;	/* 出力（n 件） */
+	uint64_t n;			/* Executions for this thread */
+	struct guest_record *recs;	/* Output (n records) */
 	int affinity_error;
 };
 
-/* 1 命令を実行し、観測値と CF を返す。bits は 16/32/64 */
+/* Execute one instruction and return the observed value and CF. bits is 16/32/64 */
 static int do_one(int is_rdseed, int bits, uint64_t *out)
 {
 	int ok;
@@ -94,7 +96,7 @@ static void *worker_fn(void *arg)
 	const struct opts *o = w->o;
 	const int bits_cycle[3] = { 16, 32, 64 };
 	uint64_t i;
-	/* レート制御: このスレッドの目標 ops/sec（全体 rate をスレッド数で按分）。0=無制限。 */
+	/* Rate control: target ops/sec for this thread (overall rate split by thread count). 0 = unlimited. */
 	double per_rate = (o->rate > 0) ? (double)o->rate / (double)o->threads : 0.0;
 	struct timespec wstart;
 	if (o->pin_base >= 0) {
@@ -123,15 +125,15 @@ static void *worker_fn(void *arg)
 		uint64_t val = 0, seq;
 		int ok;
 
-		/* 命令選択 */
+		/* Instruction selection */
 		if (o->inst == SEL_RDRAND)
 			is_rdseed = 0;
 		else if (o->inst == SEL_RDSEED)
 			is_rdseed = 1;
 		else
-			is_rdseed = (int)(i & 1);	/* both: 交互 */
+			is_rdseed = (int)(i & 1);	/* both: alternate */
 
-		/* 幅選択 */
+		/* Width selection */
 		if (o->bits == BITS_ALL)
 			bits = bits_cycle[i % 3];
 		else if (o->bits == BITS_16)
@@ -155,14 +157,14 @@ static void *worker_fn(void *arg)
 		w->recs[i].reserved = 0;
 		w->recs[i].value = val;
 
-		/* PACE_CHUNK 命令ごとに目標経過時刻へペーシング（先行していれば待つ） */
+		/* Every PACE_CHUNK instructions, pace to the target elapsed time (wait if ahead) */
 		if (per_rate > 0.0 && (i & (PACE_CHUNK - 1)) == (PACE_CHUNK - 1)) {
 			struct timespec now;
 			double elapsed, target;
 
 			clock_gettime(CLOCK_MONOTONIC, &now);
-			elapsed = ts_diff(&wstart, &now);	/* 経過秒 */
-			target = (double)(i + 1) / per_rate;	/* この時点での目標秒 */
+			elapsed = ts_diff(&wstart, &now);	/* Elapsed seconds */
+			target = (double)(i + 1) / per_rate;	/* Target seconds at this point */
 			if (target > elapsed) {
 				double d = target - elapsed;
 				struct timespec ts;
@@ -229,7 +231,7 @@ int main(int argc, char *argv[])
 			fprintf(stderr,
 				"usage: %s [--inst rdrand|rdseed|both] [--bits 16|32|64|all]\n"
 				"          [--count N] [--threads T] [--output FILE] [--rate OPS_PER_SEC] [--pin-base CPU]\n"
-				"  --rate 0（既定）=無制限（性能測定用）。>0 で発行レートを抑制（捕捉精度測定用）。\n",
+				"  --rate 0 (default) = unlimited (for performance runs). >0 limits the issue rate (for capture accuracy runs).\n",
 				argv[0]);
 			return (opt == 'h') ? 0 : 2;
 		}
@@ -248,7 +250,7 @@ int main(int argc, char *argv[])
 	ws = calloc((size_t)o.threads, sizeof(*ws));
 	if (!ws) { perror("calloc"); return 1; }
 
-	/* 各スレッドへ件数を分配（余りは先頭スレッドへ） */
+	/* Distribute the count among threads (remainder to the first thread) */
 	for (t = 0; t < o.threads; t++) {
 		ws[t].thread_id = t;
 		ws[t].o = &o;
@@ -291,7 +293,7 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 	}
-	/* バイナリ書き出し */
+	/* Binary output */
 	output_fd = open(out_path, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
 	if (output_fd < 0) { perror("open output"); return 1; }
 	if (fchmod(output_fd, 0600) != 0) { perror("chmod output"); close(output_fd); return 1; }
@@ -322,7 +324,7 @@ int main(int argc, char *argv[])
 			(unsigned long long)total, o.threads, sec,
 			total ? sec * 1e9 / (double)total : 0.0,
 			(unsigned long long)cf0, out_path);
-		/* run-benchmark.sh がパースしやすい機械可読行も出す */
+		/* Also print a machine-readable line that run-benchmark.sh can parse easily */
 		printf("BENCH count=%llu threads=%d time_s=%.6f ns_per_op=%.3f cf0=%llu\n",
 		       (unsigned long long)total, o.threads, sec,
 		       total ? sec * 1e9 / (double)total : 0.0,

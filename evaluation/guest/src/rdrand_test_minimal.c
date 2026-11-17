@@ -1,17 +1,17 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * rdrand_test_minimal.c - Phase 2 用 RDRAND/RDSEED VM-exit 発生確認プログラム
+ * rdrand_test_minimal.c - Phase 2 check that RDRAND/RDSEED cause VM exits
  *
- * ゲスト内で実行し、RDRAND 命令を N 回呼び出す。
- * ホスト側の dmesg で kvm_rndlog の VM-exit ログが出ることを確認するだけなので、
- * 返却値の正確性は確認しない。
+ * Runs inside the guest and executes the RDRAND instruction N times.
+ * It only confirms that the host's dmesg shows kvm_rndlog VM-exit logs, so it
+ * does not check that the returned values are correct.
  *
- * ビルド:
+ * Build:
  *   gcc -O2 -o rdrand_test_minimal rdrand_test_minimal.c
  *
- * 実行:
+ * Run:
  *   ./rdrand_test_minimal [count]
- *   例: ./rdrand_test_minimal 10
+ *   Example: ./rdrand_test_minimal 10
  */
 
 #include <stdio.h>
@@ -62,14 +62,14 @@ int main(int argc, char *argv[])
     if (count <= 0)
         count = 1;
 
-    printf("=== Phase 2: VM-exit 発生確認 ===\n");
-    printf("ホスト側で以下を実行して VM-exit ログを確認してください:\n");
+    printf("=== Phase 2: VM-exit check ===\n");
+    printf("Run the following on the host and check the VM-exit logs:\n");
     printf("  sudo dmesg | grep kvm_rndlog\n\n");
 
     do_rdrand(count);
     printf("\n");
     do_rdseed(count);
 
-    printf("\n完了。ホスト側の dmesg を確認してください。\n");
+    printf("\nDone. Check dmesg on the host.\n");
     return 0;
 }

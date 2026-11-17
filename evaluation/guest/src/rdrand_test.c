@@ -1,24 +1,27 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * rdrand_test.c - Phase 4 用 RDRAND/RDSEED 全レジスタ×全幅検証プログラム
+ * rdrand_test.c - Phase 4 check of RDRAND/RDSEED for every register and width
  *
- * ゲスト内で実行し、各汎用レジスタ・各オペランド幅で RDRAND/RDSEED を発行して、
- * 改造 KVM が返す固定値（Phase 3）とフラグ（CF=1）、および x86-64 の幅セマンティクス
- * （64bit=全体 / 32bit=上位ゼロ拡張 / 16bit=下位のみ更新・上位保持）を検証する。
+ * Runs inside the guest and issues RDRAND/RDSEED with each general-purpose
+ * register and each operand width, and checks the fixed values returned by the
+ * modified KVM (Phase 3), the flags (CF=1), and the x86-64 width semantics
+ * (64-bit = whole register / 32-bit = upper half zero-extended / 16-bit = only
+ * the low bits updated, upper bits preserved).
  *
- * 期待値（Phase 3 のハンドラが返す固定値）:
+ * Expected values (fixed values returned by the Phase 3 handler):
  *   RDRAND = 0x1122334455667788
  *   RDSEED = 0x8877665544332211
  *
- * 対象レジスタ: RAX,RCX,RDX,RBX,RSI,RDI,R8-R15（14個）。
- *   RSP/RBP はユーザー空間で安全に破壊できない（スタック/フレームポインタ）ため除外する。
- *   → 14 reg × 3 幅 × 2 命令 = 84 ケース。
+ * Registers: RAX, RCX, RDX, RBX, RSI, RDI, R8-R15 (14).
+ *   RSP/RBP are excluded because user space cannot safely clobber them (stack
+ *   and frame pointers).
+ *   -> 14 registers x 3 widths x 2 instructions = 84 cases.
  *
- * ビルド:
- *   make rdrand_test      （または gcc -O2 -mrdrnd -mrdseed -o rdrand_test rdrand_test.c）
- * 実行:
+ * Build:
+ *   make rdrand_test      (or gcc -O2 -mrdrnd -mrdseed -o rdrand_test rdrand_test.c)
+ * Run:
  *   ./rdrand_test
- *   ホスト側: sudo dmesg | grep kvm_rndlog
+ *   On the host: sudo dmesg | grep kvm_rndlog
  */
 
 #include <stdio.h>
@@ -39,12 +42,13 @@
 static int total, pass, fail;
 
 /*
- * 1 ケースを実行する。
+ * Runs one case.
  *   INSN    : "rdrand" / "rdseed"
- *   MOD     : オペランド幅修飾子 ""=64bit / "k"=32bit / "w"=16bit
- *   REGNAME : 対象レジスタの 64bit 名（"rax" 等。register asm で物理レジスタを固定）
- *   BITS    : 表示用ビット幅
- *   EXPECT  : 期待されるレジスタ全体（64bit）の値
+ *   MOD     : operand width modifier ""=64-bit / "k"=32-bit / "w"=16-bit
+ *   REGNAME : 64-bit name of the target register ("rax" etc.; register asm
+ *             pins the physical register)
+ *   BITS    : bit width for display
+ *   EXPECT  : expected value of the whole (64-bit) register
  */
 #define CHECK_ONE(INSN, MOD, REGNAME, BITS, EXPECT)                         \
     do {                                                                    \
@@ -74,7 +78,7 @@ static int total, pass, fail;
         }                                                                   \
     } while (0)
 
-/* 1 レジスタについて RDRAND/RDSEED × 64/32/16bit の 6 ケースを検証 */
+/* Check the 6 cases RDRAND/RDSEED x 64/32/16-bit for one register */
 #define CHECK_REG(REGNAME)                                                          \
     do {                                                                            \
         CHECK_ONE("rdrand", "",  REGNAME, 64, RDRAND_FIXED);                        \
@@ -87,10 +91,10 @@ static int total, pass, fail;
 
 int main(void)
 {
-    printf("=== Phase 4: 全レジスタ×全幅 RDRAND/RDSEED 検証 ===\n");
-    printf("期待固定値: RDRAND=0x%016lx  RDSEED=0x%016lx\n", RDRAND_FIXED, RDSEED_FIXED);
-    printf("対象: RAX,RCX,RDX,RBX,RSI,RDI,R8-R15（14 レジスタ）× {16,32,64}bit × {RDRAND,RDSEED}\n");
-    printf("除外: RSP/RBP（ユーザー空間で安全に破壊不可のため）\n\n");
+    printf("=== Phase 4: RDRAND/RDSEED check for every register and width ===\n");
+    printf("Expected fixed values: RDRAND=0x%016lx  RDSEED=0x%016lx\n", RDRAND_FIXED, RDSEED_FIXED);
+    printf("Targets: RAX,RCX,RDX,RBX,RSI,RDI,R8-R15 (14 registers) x {16,32,64}-bit x {RDRAND,RDSEED}\n");
+    printf("Excluded: RSP/RBP (user space cannot safely clobber them)\n\n");
 
     CHECK_REG("rax");
     CHECK_REG("rcx");
@@ -107,11 +111,11 @@ int main(void)
     CHECK_REG("r14");
     CHECK_REG("r15");
 
-    printf("\n結果: total=%d  PASS=%d  FAIL=%d\n", total, pass, fail);
+    printf("\nResult: total=%d  PASS=%d  FAIL=%d\n", total, pass, fail);
     if (fail == 0)
-        printf("=> 全ケース PASS（Phase 4 受け入れ）。ホスト側で sudo dmesg | grep kvm_rndlog を確認。\n");
+        printf("=> All cases PASS (Phase 4 accepted). Check sudo dmesg | grep kvm_rndlog on the host.\n");
     else
-        printf("=> %d 件 FAIL。上記の不一致を確認してください。\n", fail);
+        printf("=> %d case(s) FAIL. Check the mismatches above.\n", fail);
 
     return fail == 0 ? 0 : 1;
 }

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Phase 7 評価レポート生成。
+"""Phase 7 evaluation report generator.
 
-run-benchmark.sh が出力する results.tsv を読み、捕捉精度・性能・ログ性能の
-Markdown 表を生成する。
+Reads the results.tsv written by run-benchmark.sh and produces Markdown tables
+for capture accuracy, performance and logging performance.
 
-使い方:
-    scripts/eval/report.py [results.tsv]      # 既定: scripts/eval/results.tsv
+Usage:
+    scripts/eval/report.py [results.tsv]      # default: scripts/eval/results.tsv
 """
 import sys
 import os
@@ -30,7 +30,7 @@ def is_native(r):
 
 
 def num(s):
-    """文字列を float 化。NA/空/非数値は None。"""
+    """Convert a string to float. NA, empty and non-numeric give None."""
     try:
         return float(s)
     except (ValueError, TypeError):
@@ -38,8 +38,8 @@ def num(s):
 
 
 def native_base(rows, pattern):
-    """pattern X の native baseline ns/op を返す。
-    優先: pattern==native-X、なければ汎用 native。無ければ None。"""
+    """Return the native baseline ns/op for pattern X.
+    Prefer pattern==native-X, else the generic native. None if neither exists."""
     want = f"native-{pattern}".lower()
     row = next((r for r in rows if r["pattern"].lower() == want), None)
     if row is None:
@@ -48,7 +48,7 @@ def native_base(rows, pattern):
 
 
 def capture_table(rows):
-    out = ["### 24.1 捕捉精度", "",
+    out = ["### 24.1 Capture accuracy", "",
            "| Test | Instruction | Count | Host Log | Drop | Match Rate |",
            "| ---- | ----------- | ----: | -------: | ---: | ---------: |"]
     for r in rows:
@@ -59,7 +59,7 @@ def capture_table(rows):
 
 
 def perf_table(eval_rows, all_rows):
-    out = ["### 24.2 性能", "",
+    out = ["### 24.2 Performance", "",
            "| Pattern | Instruction | Count | Time(s) | ns/op | Slowdown |",
            "| ------- | ----------- | ----: | ------: | ----: | -------: |"]
     for r in eval_rows:
@@ -73,11 +73,12 @@ def perf_table(eval_rows, all_rows):
 
 
 def breakdown_table(eval_rows, all_rows, env=""):
-    """§24.4 オーバーヘッド内訳（3分解）: monitored / native / handler(ii) / roundtrip(i) / slowdown。
-    単一スレッド（threads==1）は roundtrip(i)=monitored−native−handler。
-    多スレッド（D）は ns/op が並列集約のため単純減算不可 → roundtrip は「—（並列）」。
-    env: 測定環境ラベル（"nested" / "bare-metal" 等）。見出しに併記する。"""
-    title = "### 24.4 オーバーヘッド内訳（3分解" + (f", {env}" if env else "") + "）"
+    """§24.4 overhead breakdown (three parts): monitored / native / handler(ii) / roundtrip(i) / slowdown.
+    Single-threaded (threads==1): roundtrip(i) = monitored - native - handler.
+    Multi-threaded (D): ns/op is a parallel aggregate and cannot simply be subtracted,
+    so roundtrip is "— (parallel)".
+    env: label of the measurement environment ("nested", "bare-metal", ...), shown in the heading."""
+    title = "### 24.4 Overhead breakdown (three parts" + (f", {env}" if env else "") + ")"
     out = [title, "",
            "| Pattern | monitored ns/op | native ns/op | handler(ii) ns | roundtrip(i) ns | slowdown |",
            "| ------- | --------------: | -----------: | -------------: | --------------: | -------: |"]
@@ -90,7 +91,7 @@ def breakdown_table(eval_rows, all_rows, env=""):
         hnd_s = f"{hnd:.1f}" if hnd else "—"
         slow = f"{mon / nat:.1f}x" if (mon and nat) else "—"
         if threads not in ("1", 1):
-            rt_s = "—（並列）"
+            rt_s = "— (parallel)"
         elif mon and nat is not None and hnd is not None:
             rt_s = f"{mon - nat - hnd:.1f}"
         else:
@@ -98,14 +99,14 @@ def breakdown_table(eval_rows, all_rows, env=""):
         out.append("| {p} | {m} | {nv} | {h} | {rt} | {s} |".format(
             p=r["pattern"], m=r["ns_per_op"], nv=nat_s, h=hnd_s, rt=rt_s, s=slow))
     out.append("")
-    out.append("> roundtrip(i) = monitored − native − handler(ii)（単一スレッド）。"
-               "D は ns/op が並列集約スループットのため単純分解不可。"
-               "handler(ii) は per-call の rdtsc 実測（D は lock 競合を含む）。")
+    out.append("> roundtrip(i) = monitored − native − handler(ii) (single thread). "
+               "For D, ns/op is an aggregate parallel throughput and cannot simply be broken down. "
+               "handler(ii) is measured per call with rdtsc (for D it includes lock contention).")
     return "\n".join(out)
 
 
 def log_table(rows):
-    out = ["### 24.3 ログ性能", "",
+    out = ["### 24.3 Logging performance", "",
            "| Pattern | Count | Drop | Host Log lines |",
            "| ------- | ----: | ---: | -------------: |"]
     for r in rows:
@@ -118,18 +119,18 @@ def log_table(rows):
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else \
         os.path.join(os.path.dirname(__file__), "results.tsv")
-    # 第 2 引数: 内訳表に併記する測定環境ラベル（任意。例: nested / bare-metal）
+    # Second argument: measurement environment label shown with the breakdown table (optional, e.g. nested / bare-metal)
     env = sys.argv[2] if len(sys.argv) > 2 else ""
     if not os.path.exists(path):
-        sys.exit(f"results not found: {path}（先に run-benchmark.sh を実行）")
+        sys.exit(f"results not found: {path} (run run-benchmark.sh first)")
     rows = load(path)
     if not rows:
-        sys.exit("results が空です")
+        sys.exit("results are empty")
 
-    # native(OFF) 行（native / native-X）は基準専用。捕捉精度/ログ性能/総括からは除外する。
+    # native (OFF) rows (native / native-X) are only a reference; leave them out of capture accuracy, logging performance and the summary.
     eval_rows = [r for r in rows if not is_native(r)]
 
-    print("# KVM RDRAND/RDSEED 監視 PoC — 評価レポート\n")
+    print("# KVM RDRAND/RDSEED monitoring PoC — evaluation report\n")
     print(capture_table(eval_rows))
     print()
     print(perf_table(eval_rows, rows))
@@ -138,15 +139,15 @@ def main():
     print()
     print(log_table(eval_rows))
     print()
-    # 総括（native 行は除く）
+    # Summary (excluding native rows)
     miss = sum(0 if r["missing"] in ("0", "NA", "") else 1 for r in eval_rows)
     drops = sum(0 if r["drop_count"] in ("0", "?", "NA", "") else 1 for r in eval_rows)
     print("---")
-    print(f"- パターン数: {len(eval_rows)}")
-    print(f"- 捕捉漏れ(missing>0)のパターン: {miss}")
-    print(f"- drop_count>0 のパターン: {drops}")
+    print(f"- Patterns: {len(eval_rows)}")
+    print(f"- Patterns with missed captures (missing>0): {miss}")
+    print(f"- Patterns with drop_count>0: {drops}")
     if eval_rows and miss == 0 and drops == 0:
-        print("- **総合: 全パターンで捕捉率 100% / drop_count 0**")
+        print("- **Overall: capture rate 100% / drop_count 0 for every pattern**")
 
 
 if __name__ == "__main__":
